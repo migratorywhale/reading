@@ -44,19 +44,8 @@ except Exception as e:
     print(f'[server] weread module not loaded: {e}', file=sys.stderr)
 
 
-def _wr_run(coro):
-    """在同步 MCP tool 上下文里跑异步 coro。"""
-    if not _WR_OK:
-        return {'error': 'weread module not loaded — check weread_state.json'}
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as ex:
-                return ex.submit(lambda: asyncio.run(coro)).result()
-    except RuntimeError:
-        pass
-    return asyncio.run(coro)
+def _wr_not_loaded():
+    return json.dumps({'error': 'weread module not loaded — check weread_state.json'}, ensure_ascii=False)
 
 
 def _wr_save(key: str, data):
@@ -127,9 +116,10 @@ async def jjwxc_fetch_chapter(novel_id: str, chapter_id: str,
 # ─── 微信读书工具 ──────────────────────────────────────────────────────────
 
 @mcp.tool()
-def weread_list_bookshelf() -> str:
+async def weread_list_bookshelf() -> str:
     """列出微信读书书架（书单 + 阅读进度）。需要 weread_state.json。"""
-    data = _wr_run(_wr_list_shelf(WEREAD_STATE_PATH))
+    if not _WR_OK: return _wr_not_loaded()
+    data = await _wr_list_shelf(WEREAD_STATE_PATH)
     if isinstance(data, dict) and 'error' in data:
         return json.dumps(data, ensure_ascii=False)
     books = data.get('books', []) if isinstance(data, dict) else []
@@ -141,9 +131,10 @@ def weread_list_bookshelf() -> str:
     }, ensure_ascii=False)
 
 @mcp.tool()
-def weread_fetch_toc(book_id: str) -> str:
+async def weread_fetch_toc(book_id: str) -> str:
     """抓微信读书章节目录（开浏览器，约 8-12s）。结果存入 reading_store。"""
-    data = _wr_run(_wr_toc(WEREAD_STATE_PATH, book_id))
+    if not _WR_OK: return _wr_not_loaded()
+    data = await _wr_toc(WEREAD_STATE_PATH, book_id)
     key = f'reading:book:weread:{book_id}:toc'
     _wr_save(key, data)
     chapters = data.get('chapters', []) if isinstance(data, dict) else []
@@ -154,9 +145,10 @@ def weread_fetch_toc(book_id: str) -> str:
     }, ensure_ascii=False)
 
 @mcp.tool()
-def weread_fetch_chapter(book_id: str, chapter_uid: str = '', max_pages: int = 200) -> str:
+async def weread_fetch_chapter(book_id: str, chapter_uid: str = '', max_pages: int = 200) -> str:
     """抓微信读书单章正文。chapter_uid='' 从上次阅读位置续读。"""
-    data = _wr_run(_wr_chap(WEREAD_STATE_PATH, book_id, chapter_uid, max_pages))
+    if not _WR_OK: return _wr_not_loaded()
+    data = await _wr_chap(WEREAD_STATE_PATH, book_id, chapter_uid, max_pages)
     key = f'reading:book:weread:{book_id}:ch:{chapter_uid or "current"}'
     _wr_save(key, data)
     return json.dumps({
@@ -167,9 +159,10 @@ def weread_fetch_chapter(book_id: str, chapter_uid: str = '', max_pages: int = 2
     }, ensure_ascii=False)
 
 @mcp.tool()
-def weread_list_notes(book_id: str, mine: bool = True) -> str:
+async def weread_list_notes(book_id: str, mine: bool = True) -> str:
     """列出微信读书书评/段落笔记。"""
-    data = _wr_run(_wr_list_reviews(WEREAD_STATE_PATH, book_id, mine=mine))
+    if not _WR_OK: return _wr_not_loaded()
+    data = await _wr_list_reviews(WEREAD_STATE_PATH, book_id, mine=mine)
     reviews = data.get('reviews', []) if isinstance(data, dict) else []
     return json.dumps({
         'total': data.get('totalCount', len(reviews)) if isinstance(data, dict) else 0,
@@ -180,23 +173,26 @@ def weread_list_notes(book_id: str, mine: bool = True) -> str:
     }, ensure_ascii=False)
 
 @mcp.tool()
-def weread_add_note(book_id: str, chapter_uid: int, content: str,
+async def weread_add_note(book_id: str, chapter_uid: int, content: str,
                     range_str: str = '', is_private: bool = False) -> str:
     """在微信读书章节留笔记。range_str='' 为章节级，'1234-1256' 精确锚定到原文。"""
-    data = _wr_run(_wr_add_review(WEREAD_STATE_PATH, book_id, chapter_uid,
-                                   content, range_str or None, is_private))
+    if not _WR_OK: return _wr_not_loaded()
+    data = await _wr_add_review(WEREAD_STATE_PATH, book_id, chapter_uid,
+                                content, range_str or None, is_private)
     return json.dumps(data, ensure_ascii=False)
 
 @mcp.tool()
-def weread_delete_note(review_id: str) -> str:
+async def weread_delete_note(review_id: str) -> str:
     """删除微信读书笔记。review_id 从 add_note 或 list_notes 获取。"""
-    data = _wr_run(_wr_del_review(WEREAD_STATE_PATH, review_id))
+    if not _WR_OK: return _wr_not_loaded()
+    data = await _wr_del_review(WEREAD_STATE_PATH, review_id)
     return json.dumps(data, ensure_ascii=False)
 
 @mcp.tool()
-def weread_list_highlights(book_id: str) -> str:
+async def weread_list_highlights(book_id: str) -> str:
     """列出微信读书高亮划线。"""
-    data = _wr_run(_wr_list_bms(WEREAD_STATE_PATH, book_id))
+    if not _WR_OK: return _wr_not_loaded()
+    data = await _wr_list_bms(WEREAD_STATE_PATH, book_id)
     return json.dumps(data, ensure_ascii=False)
 
 
