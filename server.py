@@ -132,7 +132,7 @@ async def weread_list_bookshelf() -> str:
 
 @mcp.tool()
 async def weread_fetch_toc(book_id: str) -> str:
-    """抓微信读书章节目录（开浏览器，约 8-12s）。结果存入 reading_store。"""
+    """抓微信读书章节目录。优先走官方 API，失败再开浏览器。结果存入 reading_store。"""
     if not _WR_OK: return _wr_not_loaded()
     data = await _wr_toc(WEREAD_STATE_PATH, book_id)
     key = f'reading:book:weread:{book_id}:toc'
@@ -148,14 +148,29 @@ async def weread_fetch_toc(book_id: str) -> str:
 async def weread_fetch_chapter(book_id: str, chapter_uid: str = '', max_pages: int = 200) -> str:
     """抓微信读书单章正文。chapter_uid='' 从上次阅读位置续读。"""
     if not _WR_OK: return _wr_not_loaded()
-    data = await _wr_chap(WEREAD_STATE_PATH, book_id, chapter_uid, max_pages)
     key = f'reading:book:weread:{book_id}:ch:{chapter_uid or "current"}'
-    _wr_save(key, data)
+    try:
+        data = await asyncio.wait_for(
+            _wr_chap(WEREAD_STATE_PATH, book_id, chapter_uid, max_pages),
+            timeout=45,
+        )
+    except asyncio.TimeoutError:
+        return json.dumps({
+            'saved_to': None,
+            'error': 'weread full-text capture timed out. TOC/notes/highlights still work; reader scraping needs a fresh browser-read implementation.',
+            'title': None,
+            'text_len': 0,
+            'preview': '',
+        }, ensure_ascii=False)
+    text = data.get('text', '') if isinstance(data, dict) else ''
+    if text:
+        _wr_save(key, data)
     return json.dumps({
-        'saved_to': key,
+        'saved_to': key if text else None,
+        'error': data.get('error') if isinstance(data, dict) else None,
         'title': data.get('title') if isinstance(data, dict) else None,
-        'text_len': len(data.get('text', '')) if isinstance(data, dict) else 0,
-        'preview': data.get('text', '')[:200] if isinstance(data, dict) else '',
+        'text_len': len(text),
+        'preview': text[:200],
     }, ensure_ascii=False)
 
 @mcp.tool()

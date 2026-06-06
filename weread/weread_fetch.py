@@ -40,6 +40,7 @@ VIEWPORT = {"width": 1280, "height": 900}
 
 SHELF_URL = "https://weread.qq.com/web/shelf"
 HOME_URL = "https://weread.qq.com"
+TOC_UID_PREFIX = "toc:"
 
 
 # ---------- bookId encoding cache ----------------------------------------
@@ -164,6 +165,73 @@ async def _resolve_via_book_info_api(state_path: str, raw_id: str) -> str | None
         return None
 
 
+async def _agent_gateway(api_name: str, **params) -> dict | None:
+    api_key = os.environ.get("WEREAD_API_KEY")
+    if not api_key:
+        return None
+    try:
+        import httpx as _httpx
+        async with _httpx.AsyncClient(timeout=20.0) as c:
+            r = await c.post(
+                "https://i.weread.qq.com/api/agent/gateway",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "api_name": api_name,
+                    "skill_version": "1.0.3",
+                    **params,
+                },
+            )
+        data = r.json()
+        if data.get("errcode"):
+            return None
+        return data
+    except Exception:
+        return None
+
+
+async def _fetch_agent_chapterinfo(book_id: str) -> dict | None:
+    """Fetch TOC through the official WeRead Agent Gateway when configured."""
+    try:
+        data = await _agent_gateway("/book/chapterinfo", bookId=str(book_id))
+        if not data:
+            return None
+        chapters = data.get("chapters") or []
+        if not chapters:
+            return None
+        book_info = await _agent_gateway("/book/info", bookId=str(book_id)) or {}
+        return {
+            "book_id": book_id,
+            "title": book_info.get("title", ""),
+            "author": book_info.get("author", ""),
+            "chapters": [
+                {
+                    "idx": c.get("chapterIdx", i),
+                    "title": c.get("title", f"Chapter {i + 1}"),
+                    "chapter_uid": str(c.get("chapterUid", "")),
+                    "word_count": c.get("wordCount"),
+                    "paid": c.get("paid"),
+                }
+                for i, c in enumerate(chapters)
+            ],
+        }
+    except Exception:
+        return None
+
+
+async def _find_agent_chapter(book_id: str, chapter_uid: str | int) -> dict | None:
+    toc = await _fetch_agent_chapterinfo(book_id)
+    if not toc:
+        return None
+    uid = str(chapter_uid)
+    for i, chapter in enumerate(toc.get("chapters", [])):
+        if str(chapter.get("chapter_uid")) == uid:
+            return {"dom_idx": max(0, i - 1), **chapter}
+    return None
+
+
 async def _resolve_encoded(state_path: str, book_id: str) -> str:
     """raw bookId → encoded URL form. Passthrough if already encoded.
 
@@ -218,6 +286,92 @@ def _reader_url(book_id: str, chapter_uid: str | int | None) -> str:
     if chapter_uid is None or chapter_uid == "" or str(chapter_uid).strip() == "":
         return f"https://weread.qq.com/web/reader/{enc}"
     return f"https://weread.qq.com/web/reader/{enc}k{_encode_chapter_uid(chapter_uid)}"
+
+
+def _toc_uid(idx: int) -> str:
+    return f"{TOC_UID_PREFIX}{idx}"
+
+
+def _parse_toc_uid(chapter_uid: str | int | None) -> int | None:
+    uid = "" if chapter_uid is None else str(chapter_uid).strip()
+    if not uid.startswith(TOC_UID_PREFIX):
+        return None
+    try:
+        return int(uid[len(TOC_UID_PREFIX):])
+    except ValueError:
+        return None
+
+
+async def _goto_with_fallback(page: Page, url: str, timeout: int = 45000) -> None:
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+    except Exception:
+        await page.goto(url, wait_until="commit", timeout=timeout)
+
+
+async def _open_reader(page: Page, book_id: str, encoded: str,
+                       chapter_uid: str | int | None) -> str:
+    """Open the reader.
+
+    Newer WeRead pages no longer expose usable chapter URL fragments in the DOM.
+    TOC fallback entries use chapter_uid="toc:<index>"; for those, open the
+    detail page and let WeRead's own click handler navigate into the chapter.
+    """
+    toc_idx = _parse_toc_uid(chapter_uid)
+    target_title = None
+    if toc_idx is None and str(chapter_uid or "").strip().lstrip("-").isdigit():
+        chapter = await _find_agent_chapter(book_id, chapter_uid)
+        if chapter:
+            toc_idx = chapter.get("dom_idx")
+            target_title = chapter.get("title")
+    if toc_idx is None:
+        url = _reader_url(encoded, chapter_uid)
+        await _goto_with_fallback(page, url)
+        return url
+
+    detail_url = f"{HOME_URL}/web/bookDetail/{encoded}"
+    await _goto_with_fallback(page, detail_url, timeout=30000)
+    await asyncio.sleep(3)
+    clicked = await page.evaluate("""({ idx, title }) => {
+        const items = [...document.querySelectorAll('li.readerCatalog_list_item')];
+        const el = title
+            ? items.find((item) => (item.innerText || '').trim() === title)
+            : items[idx];
+        if (!el) return false;
+        el.scrollIntoView({ block: 'center' });
+        el.click();
+        return true;
+    }""", {"idx": toc_idx, "title": target_title})
+    if not clicked:
+        raise RuntimeError(f"TOC item not found: {chapter_uid}")
+    await asyncio.sleep(4)
+    if "/web/reader/" not in page.url:
+        button_clicked = await page.evaluate("""() => {
+            const el = [...document.querySelectorAll('button')]
+                .find((node) => (node.innerText || '').includes('开始阅读') ||
+                                (node.innerText || '').includes('继续阅读'));
+            if (!el) return false;
+            el.click();
+            return true;
+        }""")
+        if button_clicked:
+            await asyncio.sleep(4)
+    return page.url
+
+
+async def _safe_evaluate(page: Page, script: str, default=None, timeout: float = 5.0):
+    try:
+        return await asyncio.wait_for(page.evaluate(script), timeout=timeout)
+    except Exception:
+        return default
+
+
+async def _safe_press(page: Page, key: str, timeout: float = 3.0) -> bool:
+    try:
+        await asyncio.wait_for(page.keyboard.press(key), timeout=timeout)
+        return True
+    except Exception:
+        return False
 
 
 # ----------------------------- context helper ---------------------------------
@@ -321,6 +475,10 @@ async def check_state_valid(state_path: str = DEFAULT_STATE_PATH) -> bool:
 # ----------------------------- TOC --------------------------------------------
 async def fetch_book_toc(state_path: str, book_id: str) -> dict:
     """Scrape chapter list from book detail page. book_id can be raw or encoded."""
+    agent_toc = await _fetch_agent_chapterinfo(book_id)
+    if agent_toc:
+        return agent_toc
+
     encoded = await _resolve_encoded(state_path, book_id)
     url = f"https://weread.qq.com/web/bookDetail/{encoded}"
     async with async_playwright() as pw:
@@ -354,6 +512,16 @@ async def fetch_book_toc(state_path: str, book_id: str) -> dict:
                 m = re.search(r"k([0-9a-f]+)", href)
                 cuid = m.group(1) if m else str(i)
                 chapters.append({"idx": i, "title": title, "chapter_uid": cuid})
+            data["chapters"] = chapters
+        if not data.get("chapters"):
+            chapters = await page.evaluate("""() => {
+                const items = [...document.querySelectorAll('li.readerCatalog_list_item')];
+                return items.map((el, idx) => ({
+                    idx,
+                    title: (el.innerText || '').trim().replace(/\\s+/g, ' '),
+                    chapter_uid: `toc:${idx}`,
+                })).filter((item) => item.title);
+            }""")
             data["chapters"] = chapters
         await _save_state_if_changed(ctx, state_path)
         await ctx.close()
@@ -405,15 +573,16 @@ async def fetch_chapter(state_path: str, book_id: str, chapter_uid: str,
       - URL-encoded form (e.g. "be5328e0813ab8bdcg0179fb") — used directly
     """
     encoded = await _resolve_encoded(state_path, book_id)
-    url = _reader_url(encoded, chapter_uid)
     captured_pages: list[str] = []
     async with async_playwright() as pw:
         ctx = await _new_context(pw, state_path=state_path, headless=True)
         page = await ctx.new_page()
-        await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        await _open_reader(page, book_id, encoded, chapter_uid)
         await asyncio.sleep(3)
-        page_title = await page.evaluate(
-            "() => document.querySelector('.readerTopBar h1')?.innerText || document.title"
+        page_title = await _safe_evaluate(
+            page,
+            "() => document.querySelector('.readerTopBar h1')?.innerText || document.title",
+            default=await page.title(),
         )
 
         seen_hashes: set[int] = set()
@@ -422,8 +591,18 @@ async def fetch_chapter(state_path: str, book_id: str, chapter_uid: str,
 
         async def drain() -> int:
             """Pull new captures, append to list. Returns count of NEW captures."""
-            arr = await page.evaluate(
-                "() => { const a = window.__weread_captured || []; window.__weread_captured = []; return a; }"
+            arr = await _safe_evaluate(
+                page,
+                """() => {
+                    const a = window.__weread_captured || [];
+                    window.__weread_captured = [];
+                    const el = document.getElementById('preRenderContent');
+                    if (el && el.innerHTML) {
+                        a.push({ ts: Date.now(), html: el.innerHTML });
+                    }
+                    return a;
+                }""",
+                default=[],
             )
             new_count = 0
             for entry in arr:
@@ -449,9 +628,8 @@ async def fetch_chapter(state_path: str, book_id: str, chapter_uid: str,
         # ArrowRight ≈ 1 screen, 1 section = ~6-10 screens, so be generous with idle threshold.
         IDLE_THRESHOLD = 15
         for pg in range(max_pages):
-            try:
-                await page.keyboard.press("ArrowRight")
-            except Exception:
+            pressed = await _safe_press(page, "ArrowRight")
+            if not pressed:
                 try:
                     await page.locator(".readerControls_right, .renderTargetContainer").first.click(timeout=2000)
                 except Exception:
@@ -463,7 +641,7 @@ async def fetch_chapter(state_path: str, book_id: str, chapter_uid: str,
                 # Every 8 idle keypresses, also try PageDown as fallback
                 if idle_count % 8 == 0:
                     try:
-                        await page.keyboard.press("PageDown")
+                        await _safe_press(page, "PageDown")
                         await asyncio.sleep(0.8)
                         new = await drain()
                         if new > 0:
@@ -471,8 +649,10 @@ async def fetch_chapter(state_path: str, book_id: str, chapter_uid: str,
                     except Exception:
                         pass
                 # "End of book" banner — stop
-                ending = await page.evaluate(
-                    "() => !!document.querySelector('.readerFooter_ending_finish, .readerFooter_ending')"
+                ending = await _safe_evaluate(
+                    page,
+                    "() => !!document.querySelector('.readerFooter_ending_finish, .readerFooter_ending')",
+                    default=False,
                 )
                 if ending:
                     book_ended = True
@@ -517,8 +697,15 @@ async def fetch_chapter(state_path: str, book_id: str, chapter_uid: str,
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
 
     chapter_title = section_titles_seen[0] if section_titles_seen else page_title
+    error = None
+    if not text:
+        error = (
+            "weread reader rendered no extractable text. "
+            "TOC/notes/highlights may still work; full-text capture likely needs "
+            "a fresh browser read request or updated reader scraping logic."
+        )
 
-    return {
+    result = {
         "book_id": book_id,
         "chapter_uid": chapter_uid,
         "title": chapter_title,
@@ -530,6 +717,9 @@ async def fetch_chapter(state_path: str, book_id: str, chapter_uid: str,
         "book_ended": book_ended,
         "captured_at": int(time.time()),
     }
+    if error:
+        result["error"] = error
+    return result
 
 
 # CLI smoke test

@@ -30,23 +30,29 @@
     }
   });
 
+  let started = false;
   function start() {
-    obs.observe(document.documentElement || document, {
+    if (started) return;
+    const root = document.documentElement || document;
+    if (!root) {
+      setTimeout(start, 0);
+      return;
+    }
+    started = true;
+    obs.observe(root, {
       childList: true,
       subtree: true,
       characterData: false,
     });
+    tryCapture(document.getElementById('preRenderContent'));
     // 3. Poll fallback (in case observer misses a fast insert+remove)
     const poll = setInterval(() => {
       const el = document.getElementById('preRenderContent');
       if (el) tryCapture(el);
     }, 200);
-    setTimeout(() => clearInterval(poll), 30000);
+    setTimeout(() => clearInterval(poll), 120000);
   }
 
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', start, { once: true });
-  } else {
-    start();
-  }
+  start();
+  document.addEventListener('DOMContentLoaded', start, { once: true });
 })();
