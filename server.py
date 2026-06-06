@@ -122,6 +122,13 @@ async def weread_list_bookshelf() -> str:
     data = await _wr_list_shelf(WEREAD_STATE_PATH)
     if isinstance(data, dict) and 'error' in data:
         return json.dumps(data, ensure_ascii=False)
+    if isinstance(data, dict) and data.get('errCode'):
+        return json.dumps({
+            'error': 'weread login expired',
+            'errCode': data.get('errCode'),
+            'errMsg': data.get('errMsg'),
+            'hint': 'Refresh ~/.mcp-memory/weread_state.json from browser cookies.',
+        }, ensure_ascii=False)
     books = data.get('books', []) if isinstance(data, dict) else []
     return json.dumps({
         'total': len(books),
@@ -152,7 +159,7 @@ async def weread_fetch_chapter(book_id: str, chapter_uid: str = '', max_pages: i
     try:
         data = await asyncio.wait_for(
             _wr_chap(WEREAD_STATE_PATH, book_id, chapter_uid, max_pages),
-            timeout=45,
+            timeout=180,
         )
     except asyncio.TimeoutError:
         return json.dumps({

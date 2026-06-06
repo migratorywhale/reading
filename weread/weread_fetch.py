@@ -309,6 +309,117 @@ async def _goto_with_fallback(page: Page, url: str, timeout: int = 45000) -> Non
         await page.goto(url, wait_until="commit", timeout=timeout)
 
 
+async def _page_looks_404(page: Page) -> bool:
+    title = await _safe_evaluate(page, "() => document.title", default="")
+    if isinstance(title, str) and "404" in title:
+        return True
+    body_head = await _safe_evaluate(
+        page,
+        "() => (document.body?.innerText || '').slice(0, 300)",
+        default="",
+    )
+    return isinstance(body_head, str) and "404 Not Found" in body_head
+
+
+async def _click_catalog_item(page: Page, encoded: str, idx: int,
+                              title: str | None = None) -> str:
+    reader_url = f"{HOME_URL}/web/reader/{encoded}"
+    await _goto_with_fallback(page, reader_url, timeout=45000)
+    catalog_button = None
+    for _ in range(12):
+        catalog_button = await _safe_evaluate(
+            page,
+            """() => {
+                const el = document.querySelector('button.readerControls_item.catalog');
+                if (!el) return null;
+                const r = el.getBoundingClientRect();
+                return { x: r.x + r.width / 2, y: r.y + r.height / 2, w: r.width, h: r.height };
+            }""",
+            default=None,
+            timeout=2.0,
+        )
+        if catalog_button and catalog_button.get("w") and catalog_button.get("h"):
+            break
+        await asyncio.sleep(1)
+    if not catalog_button or not catalog_button.get("w") or not catalog_button.get("h"):
+        # Fixed viewport fallback. The reader controls are stable at 1280x900,
+        # while Playwright can intermittently fail to see their rect in headless
+        # mode during slow loads.
+        catalog_button = {"x": 1209, "y": 229, "w": 48, "h": 48}
+    await page.mouse.click(catalog_button["x"], catalog_button["y"])
+    item_box = None
+    for attempt in range(8):
+        if attempt == 4:
+            await page.mouse.click(catalog_button["x"], catalog_button["y"])
+        await asyncio.sleep(1)
+        try:
+            item_box = await asyncio.wait_for(
+                page.evaluate(
+                    """({ idx, title }) => {
+                        const norm = (s) => (s || '').trim().replace(/\\s+/g, ' ');
+                        const boxes = [...document.querySelectorAll('li.readerCatalog_list_item')]
+                            .map((el, domIdx) => {
+                                const r = el.getBoundingClientRect();
+                                return {
+                                    domIdx,
+                                    text: norm(el.innerText),
+                                    x: r.x + r.width / 2,
+                                    y: r.y + r.height / 2,
+                                    w: r.width,
+                                    h: r.height,
+                                    visible: r.width > 0 && r.height > 0 && getComputedStyle(el).visibility !== 'hidden',
+                                };
+                            })
+                            .filter((box) => box.visible);
+                        const target = title
+                            ? boxes.find((box) => box.text === norm(title))
+                            : boxes.find((box) => box.domIdx === idx) || boxes[idx];
+                        return target || null;
+                    }""",
+                    {"idx": idx, "title": title},
+                ),
+                timeout=3.0,
+            )
+        except Exception:
+            item_box = None
+        if item_box and item_box.get("w") and item_box.get("h"):
+            break
+    if not item_box or not item_box.get("w") or not item_box.get("h"):
+        if title is not None:
+            raise RuntimeError(f"TOC item not found: {title}")
+        # Coordinate fallback for the visible right-side catalog. The first
+        # item center is around y=308, then +54 per row in the fixed viewport.
+        item_box = {"x": 933, "y": 308 + (54 * idx), "w": 440, "h": 54}
+    await page.mouse.click(item_box["x"], item_box["y"])
+    for _ in range(15):
+        count = await _safe_evaluate(
+            page,
+            "() => (window.__weread_captured || []).length",
+            default=0,
+            timeout=1.5,
+        )
+        if count:
+            return page.url
+        await asyncio.sleep(1)
+
+    # One retry: the first click can occasionally land while the side drawer is
+    # animating. Re-open catalog and click the same coordinate again.
+    await page.mouse.click(catalog_button["x"], catalog_button["y"])
+    await asyncio.sleep(2)
+    await page.mouse.click(item_box["x"], item_box["y"])
+    for _ in range(15):
+        count = await _safe_evaluate(
+            page,
+            "() => (window.__weread_captured || []).length",
+            default=0,
+            timeout=1.5,
+        )
+        if count:
+            break
+        await asyncio.sleep(1)
+    return page.url
+
+
 async def _open_reader(page: Page, book_id: str, encoded: str,
                        chapter_uid: str | int | None) -> str:
     """Open the reader.
@@ -324,39 +435,23 @@ async def _open_reader(page: Page, book_id: str, encoded: str,
         if chapter:
             toc_idx = chapter.get("dom_idx")
             target_title = chapter.get("title")
+        else:
+            # Without Agent Gateway chapterinfo, numeric chapter_uid cannot be
+            # converted to WeRead's URL hash. Treat it as a catalog index and
+            # use WeRead's own click handler instead of opening k<uid>, which
+            # often lands on the current/end page or 404s.
+            toc_idx = int(str(chapter_uid).strip())
     if toc_idx is None:
         url = _reader_url(encoded, chapter_uid)
         await _goto_with_fallback(page, url)
+        if (
+            str(chapter_uid or "").strip().lstrip("-").isdigit()
+            and await _page_looks_404(page)
+        ):
+            return await _click_catalog_item(page, encoded, int(str(chapter_uid).strip()))
         return url
 
-    detail_url = f"{HOME_URL}/web/bookDetail/{encoded}"
-    await _goto_with_fallback(page, detail_url, timeout=30000)
-    await asyncio.sleep(3)
-    clicked = await page.evaluate("""({ idx, title }) => {
-        const items = [...document.querySelectorAll('li.readerCatalog_list_item')];
-        const el = title
-            ? items.find((item) => (item.innerText || '').trim() === title)
-            : items[idx];
-        if (!el) return false;
-        el.scrollIntoView({ block: 'center' });
-        el.click();
-        return true;
-    }""", {"idx": toc_idx, "title": target_title})
-    if not clicked:
-        raise RuntimeError(f"TOC item not found: {chapter_uid}")
-    await asyncio.sleep(4)
-    if "/web/reader/" not in page.url:
-        button_clicked = await page.evaluate("""() => {
-            const el = [...document.querySelectorAll('button')]
-                .find((node) => (node.innerText || '').includes('开始阅读') ||
-                                (node.innerText || '').includes('继续阅读'));
-            if (!el) return false;
-            el.click();
-            return true;
-        }""")
-        if button_clicked:
-            await asyncio.sleep(4)
-    return page.url
+    return await _click_catalog_item(page, encoded, int(toc_idx), target_title)
 
 
 async def _safe_evaluate(page: Page, script: str, default=None, timeout: float = 5.0):
